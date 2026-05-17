@@ -1,20 +1,20 @@
 """
-BMG-HMO Billing File Processor — Streamlit App  v10.8.1-HOTFIX
+BMG-HMO Billing File Processor — Streamlit App  v10.8.2
 
-CRITICAL FIXES FOR PYTHON 3.11+ CRASHES:
-  ✓ Removed wb._sheets direct manipulation (unsafe in Python 3.11)
-  ✓ Added garbage collection for memory optimization
-  ✓ Wrapped BytesIO buffers in proper try/finally blocks
-  ✓ Fixed workbook cloning and resource cleanup
-  ✓ Improved error handling with detailed logging
-  ✓ Added explicit workbook closing
-  ✓ Safe sheet reordering using move_sheet() method
+FIXES over v10.8.1:
+  ✓ FIX 1 — Removed wb.close() calls (openpyxl has no .close())
+  ✓ FIX 2 — BytesIO buffers no longer closed while workbook still alive
+  ✓ FIX 3 — prog.empty() now called on success to prevent white-flash rerun loop
+  ✓ FIX 4 — Removed value=False from checkbox to stop rerun loop
+  ✓ FIX 5 — Fixed wb.worksheets.index(ws) (was broken wb.index(ws))
+  ✓ FIX 6 — Fixed empty label warnings: file_uploader and text_input now have
+             non-empty labels with label_visibility="collapsed"
 """
 
-import os, io, json, re, gc
+import os, io, json, re, gc, time
 import pandas as pd
 import streamlit as st
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from copy import copy
@@ -22,7 +22,7 @@ from copy import copy
 # ─── PATHS ────────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MASTER_PATH = os.path.join(BASE_DIR, "master_reference.json")
-LOGO_PATH = os.path.join(BASE_DIR, "images", "logo.png")
+LOGO_PATH   = os.path.join(BASE_DIR, "images", "logo.png")
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
 HEADER_ROW = 18
@@ -69,13 +69,12 @@ WF_READ_COLS = WF_OUTPUT_COLS + ["Reference"]
 
 _ID_PATTERN = re.compile(r'^\d{4}-')
 
-# Values that identify a ROW HEADER or truly blank cell
 _HEADER_ID_VALUES = {"nan", "none", "", "id number", "amount in words", "#"}
 
 HEADER_COLOR    = "C00000"
 HIGHLIGHT_COLOR = "FFF2CC"
 
-# ─── Entity → output sheet name ──────────────────────────────────────────────
+# ─── Entity → output sheet name ───────────────────────────────────────────────
 def _entity_sheet(entity: str) -> str:
     el = entity.strip().lower()
     if "sleek" in el:
@@ -171,15 +170,13 @@ def _concat_preserve(base: pd.DataFrame, *others) -> pd.DataFrame:
     return result
 
 
-# ─── ROW FILTER ────────────────────────────────────────────────────────────────
+# ─── ROW FILTER ───────────────────────────────────────────────────────────────
 def _is_header_id(val) -> bool:
-    """True if this Id Number value looks like a header/blank cell, not a real ID."""
     cleaned = str(val).strip().lower()
     return cleaned in _HEADER_ID_VALUES
 
 
 def _is_entirely_blank_row(row: pd.Series) -> bool:
-    """True only if every cell in the row is NaN or empty string."""
     for v in row:
         s = str(v).strip() if v is not None else ""
         if s and s.lower() not in ("nan", "none"):
@@ -188,12 +185,10 @@ def _is_entirely_blank_row(row: pd.Series) -> bool:
 
 
 def _valid_rows(df: pd.DataFrame) -> pd.Series:
-    """Returns a boolean mask: True = keep the row."""
     return ~df.apply(_is_entirely_blank_row, axis=1)
 
 
 def _log_id_info(raw_series: pd.Series, label: str, logs: list):
-    """Log rows with header-like or non-standard IDs for visibility."""
     cleaned = raw_series.astype(str).str.strip()
 
     header_like = cleaned[raw_series.apply(_is_header_id)]
@@ -318,7 +313,7 @@ def phase1_validate(wb, filename: str) -> dict:
 # ─── PHASE 2: SYNC ────────────────────────────────────────────────────────────
 def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
     logs: list[str] = []
-    gc.collect()  # Clean memory before large operation
+    gc.collect()
 
     wf = _read_sheet(wb, "Working File")
     logs.append(f"  Working File columns found    : {list(wf.columns)}")
@@ -331,13 +326,10 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
         else:
             raise KeyError("'Id Number' column not found in Working File sheet.")
 
-    # Normalise: strip whitespace from Id Number for reliable matching
     wf["Id Number"] = wf["Id Number"].astype(str).str.strip()
-
     _log_id_info(wf["Id Number"], "Working File", logs)
 
     wf_total_before = len(wf)
-    # Drop ONLY fully blank rows
     valid_mask = _valid_rows(wf)
     wf_dropped = wf_total_before - valid_mask.sum()
     wf = wf[valid_mask].copy()
@@ -385,13 +377,10 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
             wf.attrs["att_ids"] = set()
             return wf, logs
 
-    # Normalise: strip whitespace from Id Number for reliable matching
     att["Id Number"] = att["Id Number"].astype(str).str.strip()
-
     _log_id_info(att["Id Number"], "Attachment", logs)
 
     att_total_before = len(att)
-    # Drop ONLY fully blank rows from Attachment too
     att_valid_mask = _valid_rows(att)
     att_dropped = att_total_before - att_valid_mask.sum()
     att = att[att_valid_mask].copy()
@@ -510,7 +499,7 @@ def phase2_sync(wb) -> tuple[pd.DataFrame, list[str]]:
         )
         logs.append(f"    → {sname:<14}: {count} row(s)")
 
-    gc.collect()  # Clean after large operations
+    gc.collect()
     return wf, logs
 
 
@@ -691,15 +680,14 @@ def _sort_by_sc(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─── SUMMARY SHEET WRITER ─────────────────────────────────────────────────────
 def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
-    NUM_FMT    = "#,##0.00"
-    CAL_FONT   = "Calibri"
+    NUM_FMT   = "#,##0.00"
+    CAL_FONT  = "Calibri"
 
-    GREEN_FILL  = PatternFill("solid", fgColor="C00000")
-    WHITE_FONT  = Font(bold=True, color="FFFFFF", name=CAL_FONT, size=11)
-    BOLD_FONT   = Font(bold=True, name=CAL_FONT, size=11)
-    REG_FONT    = Font(name=CAL_FONT, size=11)
-    TITLE_FONT  = Font(bold=True, name=CAL_FONT, size=13)
-
+    GREEN_FILL = PatternFill("solid", fgColor="C00000")
+    WHITE_FONT = Font(bold=True, color="FFFFFF", name=CAL_FONT, size=11)
+    BOLD_FONT  = Font(bold=True, name=CAL_FONT, size=11)
+    REG_FONT   = Font(name=CAL_FONT, size=11)
+    TITLE_FONT = Font(bold=True, name=CAL_FONT, size=13)
     MED_SIDE   = Side(style="medium", color="000000")
 
     def med_tb():
@@ -760,8 +748,8 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
     DATA_START = HDR_ROW + 1
     for i, (label, principal, dependent, advances, total) in enumerate(data_rows):
         r = DATA_START + i
-        cell_a       = ws.cell(row=r, column=1, value=label)
-        cell_a.font  = REG_FONT
+        cell_a      = ws.cell(row=r, column=1, value=label)
+        cell_a.font = REG_FONT
         for ci, val in enumerate([principal, dependent, advances, total], start=2):
             cell               = ws.cell(row=r, column=ci, value=val if val else None)
             cell.number_format = NUM_FMT
@@ -787,8 +775,8 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
         cell.border        = med_tb()
     ws.row_dimensions[TOTAL_ROW].height = 18
 
-    SPACER2  = TOTAL_ROW + 1
-    INV_ROW  = SPACER2  + 1
+    SPACER2 = TOTAL_ROW + 1
+    INV_ROW = SPACER2  + 1
     ws.row_dimensions[SPACER2].height = 6
 
     cell_inv      = ws.cell(row=INV_ROW, column=1, value="Invoice")
@@ -799,8 +787,8 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
     inv_e.alignment     = Alignment(horizontal="right")
     ws.row_dimensions[INV_ROW].height = 16
 
-    SPACER3  = INV_ROW  + 1
-    CHK_ROW  = SPACER3  + 1
+    SPACER3 = INV_ROW  + 1
+    CHK_ROW = SPACER3  + 1
     ws.row_dimensions[SPACER3].height = 6
 
     cell_chk      = ws.cell(row=CHK_ROW, column=1, value="To Check")
@@ -817,21 +805,20 @@ def _write_summary_sheet(ws, df: pd.DataFrame, period_label: str = ""):
         ws.column_dimensions[col_letter].width = 17
 
 
-# ─── WRITE DATA TABLE ──────────────────────────────────────────────────────────
+# ─── WRITE DATA TABLE — Working File ──────────────────────────────────────────
 def _write_data_sheet(ws, df_subset: pd.DataFrame, att_ids: set[str]):
     _write_table(ws, df_subset, att_ids, header_row=HEADER_ROW)
 
 
-# ─── WRITE DATA TABLE — Entity sheets ──────────────────────────────────────────
+# ─── WRITE DATA TABLE — Entity sheets ─────────────────────────────────────────
 def _write_data_sheet_entity(ws, df_subset: pd.DataFrame, att_ids: set[str]):
     _write_table(ws, df_subset, att_ids, header_row=1)
-    # Grand total row at the very bottom
     if not df_subset.empty:
         total_row = 1 + 1 + len(df_subset)
         _write_grand_totals_row(ws, df_subset, total_row)
 
 
-# ─── SHARED TABLE WRITER ───────────────────────────────────────────────────────
+# ─── SHARED TABLE WRITER ──────────────────────────────────────────────────────
 def _write_table(ws, df_subset: pd.DataFrame, att_ids: set[str], header_row: int):
     df_reset    = df_subset.reset_index(drop=True)
     n_data      = len(df_reset)
@@ -865,8 +852,8 @@ def _write_table(ws, df_subset: pd.DataFrame, att_ids: set[str], header_row: int
                     val = round(float(val), 2)
                 except (TypeError, ValueError):
                     pass
-            cell               = ws.cell(row=write_r, column=col_i, value=val)
-            cell.fill          = _make_highlight_fill() if is_manual else _make_no_fill()
+            cell      = ws.cell(row=write_r, column=col_i, value=val)
+            cell.fill = _make_highlight_fill() if is_manual else _make_no_fill()
             if col_name in FINANCIAL_COLS and val is not None:
                 cell.number_format = "#,##0.00"
 
@@ -897,19 +884,15 @@ def _write_table(ws, df_subset: pd.DataFrame, att_ids: set[str], header_row: int
     ws.auto_filter.filterColumn.clear()
 
 
-# ─── GRAND TOTALS ROW ──────────────────────────────────────────────────────────
+# ─── GRAND TOTALS ROW ─────────────────────────────────────────────────────────
 def _write_grand_totals_row(ws, df_full: pd.DataFrame, current_row: int):
-    """Appends a single GRAND TOTAL row at current_row."""
-    NUM_FMT    = "#,##0.00"
-    TOTAL_FILL = PatternFill("solid", fgColor="C00000")
-    TOTAL_FONT = Font(bold=True, color="FFFFFF", size=11)
+    NUM_FMT       = "#,##0.00"
+    TOTAL_FILL    = PatternFill("solid", fgColor="C00000")
+    TOTAL_FONT    = Font(bold=True, color="FFFFFF", size=11)
     TOTAL_ALIGN_L = Alignment(horizontal="left",  vertical="center", indent=1)
     TOTAL_ALIGN_R = Alignment(horizontal="right", vertical="center")
-    MED_TOP    = Border(top=Side(style="medium", color="000000"))
+    MED_TOP       = Border(top=Side(style="medium", color="000000"))
 
-    n_cols = len(WF_OUTPUT_COLS)
-
-    # Compute sums
     totals: dict[str, float] = {}
     for fc in FINANCIAL_COLS:
         if fc in df_full.columns:
@@ -929,10 +912,10 @@ def _write_grand_totals_row(ws, df_full: pd.DataFrame, current_row: int):
             cell.font      = TOTAL_FONT
             cell.alignment = TOTAL_ALIGN_L
         elif col_name in FINANCIAL_COLS:
-            cell.value          = totals.get(col_name, 0.0)
-            cell.font           = TOTAL_FONT
-            cell.alignment      = TOTAL_ALIGN_R
-            cell.number_format  = NUM_FMT
+            cell.value         = totals.get(col_name, 0.0)
+            cell.font          = TOTAL_FONT
+            cell.alignment     = TOTAL_ALIGN_R
+            cell.number_format = NUM_FMT
         else:
             cell.value = None
             cell.font  = TOTAL_FONT
@@ -959,9 +942,9 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set[str]):
             grp = pd.concat([grp[is_att], grp[~is_att]], ignore_index=True)
         groups_in_order.append((label, grp))
 
-    current_row   = 1
-    first_filter  = None
-    col_widths    = [len(h) for h in WF_OUTPUT_COLS]
+    current_row  = 1
+    first_filter = None
+    col_widths   = [len(h) for h in WF_OUTPUT_COLS]
 
     section_fill  = PatternFill("solid", fgColor=SECTION_HEADER_BG)
     section_font  = Font(bold=True, color=SECTION_HEADER_COLOR, size=11)
@@ -969,15 +952,15 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set[str]):
                               indent=1, wrap_text=False)
 
     for label, grp in groups_in_order:
-        sec_cell        = ws.cell(row=current_row, column=1, value=label)
-        sec_cell.font   = section_font
-        sec_cell.fill   = section_fill
+        sec_cell           = ws.cell(row=current_row, column=1, value=label)
+        sec_cell.font      = section_font
+        sec_cell.fill      = section_fill
         sec_cell.alignment = section_align
         ws.row_dimensions[current_row].height = 18
 
         for col_i in range(2, n_cols + 1):
-            c = ws.cell(row=current_row, column=col_i)
-            c.fill = section_fill
+            c       = ws.cell(row=current_row, column=col_i)
+            c.fill  = section_fill
             c.value = None
         try:
             ws.merge_cells(
@@ -1027,7 +1010,7 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set[str]):
 
             current_row += 1
 
-        current_row += 1
+        current_row += 1  # spacer between groups
 
     for ci, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(ci)].width = min(width + 2, 50)
@@ -1036,12 +1019,11 @@ def _write_sleek_sheet(ws, df_sleek: pd.DataFrame, att_ids: set[str]):
         ws.auto_filter.ref = f"A{first_filter}:{last_letter}{first_filter}"
         ws.auto_filter.filterColumn.clear()
 
-    # Grand total row at the very bottom
     if not df_sleek.empty:
         _write_grand_totals_row(ws, df_sleek, current_row)
 
 
-# ─── SO COMPANY EXTRACTOR ─────────────────────────────────────────────────────
+# ─── SO COMPANY EXTRACTOR ────────────────────────────────────────────────────
 def _so_company(entity: str) -> str:
     e = entity.strip()
     if not e:
@@ -1111,11 +1093,11 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set[str]):
     last_letter = get_column_letter(n_cols)
 
     df_work = df_so.copy().reset_index(drop=True)
-    df_work["_raw_co"] = df_work["Entity"].apply(lambda e: _so_company(_s(e)))
-    canon_map = _normalise_so_companies(df_work["_raw_co"].tolist())
+    df_work["_raw_co"]  = df_work["Entity"].apply(lambda e: _so_company(_s(e)))
+    canon_map           = _normalise_so_companies(df_work["_raw_co"].tolist())
     df_work["_company"] = df_work["_raw_co"].map(canon_map)
 
-    all_companies = sorted(df_work["_company"].unique(), key=lambda n: n.lower())
+    all_companies   = sorted(df_work["_company"].unique(), key=lambda n: n.lower())
     groups_in_order = []
     for company in all_companies:
         grp = df_work[df_work["_company"] == company].drop(
@@ -1197,7 +1179,7 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set[str]):
 
             current_row += 1
 
-        current_row += 1
+        current_row += 1  # spacer between companies
 
     for ci, width in enumerate(col_widths, start=1):
         ws.column_dimensions[get_column_letter(ci)].width = min(width + 2, 50)
@@ -1206,7 +1188,6 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set[str]):
         ws.auto_filter.ref = f"A{first_filter}:{last_letter}{first_filter}"
         ws.auto_filter.filterColumn.clear()
 
-    # Grand total row at the very bottom
     if not df_so.empty:
         _write_grand_totals_row(ws, df_so, current_row)
 
@@ -1214,23 +1195,20 @@ def _write_so_sheet(ws, df_so: pd.DataFrame, att_ids: set[str]):
 # ─── PHASE 3: BUILD OUTPUT ────────────────────────────────────────────────────
 def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
                  period_label: str = "") -> bytes:
-    """
-    Build output workbook with SAFE sheet handling for Python 3.11+
-    """
-    gc.collect()  # Clean memory before large operation
-    
+    gc.collect()
+
     wb      = source_wb
     att_ids: set[str] = df.attrs.get("att_ids", set())
 
-    # SAFE: Delete sheets one-by-one
+    # Remove non-essential sheets
     for sname in list(wb.sheetnames):
         if sname not in KEEP_SHEETS:
             try:
                 del wb[sname]
             except Exception:
                 pass
-    
-    gc.collect()  # Clean after deletions
+
+    gc.collect()
 
     att_ids_local: set[str] = df.attrs.get("att_ids", set())
     if att_ids_local:
@@ -1240,12 +1218,14 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
     else:
         df_sorted = df.copy()
 
+    # Write Working File sheet
     ws_wf = wb["Working File"]
     _write_data_sheet(ws_wf, df_sorted, att_ids)
 
     df_work = df_sorted.copy()
     df_work["_dest"] = df_work["Entity"].apply(lambda e: _entity_sheet(_s(e)))
 
+    # Write entity sheets
     for sname in ENTITY_SHEETS:
         subset = df_work[df_work["_dest"] == sname].drop(columns=["_dest"]).copy()
         subset.attrs.update(df.attrs)
@@ -1270,9 +1250,10 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
             _write_so_sheet(ws_new, subset, att_ids)
         else:
             _write_data_sheet_entity(ws_new, subset, att_ids)
-        
-        gc.collect()  # Clean after each sheet
 
+        gc.collect()
+
+    # Write Summary sheet
     if "Summary" in wb.sheetnames:
         try:
             del wb["Summary"]
@@ -1281,49 +1262,43 @@ def build_output(source_wb, df: pd.DataFrame, is_xlsm: bool = False,
     ws_summary = wb.create_sheet(title="Summary")
     _write_summary_sheet(ws_summary, df_sorted, period_label=period_label)
 
-    # ─── SAFE sheet reordering (no wb._sheets direct manipulation) ────────────
-    desired  = ["Summary", "Attachment", "Working File"] + ENTITY_SHEETS
-    
-    # Remove any sheets not in desired that exist
+    # ── FIX 5: Safe sheet reordering using wb.worksheets.index() ─────────────
+    desired = ["Summary", "Attachment", "Working File"] + ENTITY_SHEETS
+
+    # Drop any stray sheets not in desired
     for sname in list(wb.sheetnames):
         if sname not in desired:
             try:
                 del wb[sname]
             except Exception:
                 pass
-    
-    # Reorder sheets using safe method
-    try:
-        # Python 3.10+ has move_sheet method
-        if hasattr(wb, 'move_sheet'):
-            for target_idx, sheet_name in enumerate(desired):
-                if sheet_name in wb.sheetnames:
-                    try:
-                        ws = wb[sheet_name]
-                        current_idx = wb.index(ws)
-                        if current_idx != target_idx:
-                            wb.move_sheet(ws, offset=target_idx - current_idx)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    
-    gc.collect()  # Clean before save
 
-    # ─── SAFE buffer handling ────────────────────────────────────────────────
+    # Reorder with move_sheet using the corrected .worksheets.index() call
+    if hasattr(wb, "move_sheet"):
+        for target_idx, sheet_name in enumerate(desired):
+            if sheet_name not in wb.sheetnames:
+                continue
+            try:
+                ws_obj      = wb[sheet_name]
+                current_idx = wb.worksheets.index(ws_obj)   # ← FIX 5
+                offset      = target_idx - current_idx
+                if offset != 0:
+                    wb.move_sheet(ws_obj, offset=offset)
+            except Exception:
+                pass
+
+    gc.collect()
+
+    # Save to buffer
     buf = io.BytesIO()
     try:
         wb.save(buf)
         buf.seek(0)
-        result = buf.getvalue()
-        return result
+        return buf.getvalue()
     except Exception as e:
         raise ValueError(f"Failed to save workbook: {e}")
     finally:
-        try:
-            buf.close()
-        except Exception:
-            pass
+        buf.close()
         gc.collect()
 
 
@@ -1357,53 +1332,31 @@ def inject_css():
             font-family: 'Lato', sans-serif;
             color: var(--ash);
         }
-        .stApp {
-            background: var(--smoke);
-        }
+        .stApp { background: var(--smoke); }
 
         .hero {
             background: var(--red-700);
             background-image:
-                repeating-linear-gradient(
-                    0deg,
-                    transparent,
-                    transparent 39px,
-                    rgba(255,255,255,0.04) 39px,
-                    rgba(255,255,255,0.04) 40px
-                ),
-                repeating-linear-gradient(
-                    90deg,
-                    transparent,
-                    transparent 39px,
-                    rgba(255,255,255,0.04) 39px,
-                    rgba(255,255,255,0.04) 40px
-                );
+                repeating-linear-gradient(0deg, transparent, transparent 39px,
+                    rgba(255,255,255,0.04) 39px, rgba(255,255,255,0.04) 40px),
+                repeating-linear-gradient(90deg, transparent, transparent 39px,
+                    rgba(255,255,255,0.04) 39px, rgba(255,255,255,0.04) 40px);
             margin: -1rem -1rem 0 -1rem;
-            padding: 0 40px;
-            height: 88px;
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            position: relative;
-            overflow: hidden;
+            padding: 0 40px; height: 88px;
+            display: flex; align-items: center; gap: 20px;
+            position: relative; overflow: hidden;
         }
         .hero::after {
-            content: '';
-            position: absolute;
+            content: ''; position: absolute;
             right: -60px; top: -60px;
-            width: 220px; height: 220px;
-            border-radius: 50%;
-            background: rgba(255,255,255,0.06);
-            pointer-events: none;
+            width: 220px; height: 220px; border-radius: 50%;
+            background: rgba(255,255,255,0.06); pointer-events: none;
         }
         .hero::before {
-            content: '';
-            position: absolute;
+            content: ''; position: absolute;
             right: 60px; bottom: -80px;
-            width: 160px; height: 160px;
-            border-radius: 50%;
-            background: rgba(0,0,0,0.08);
-            pointer-events: none;
+            width: 160px; height: 160px; border-radius: 50%;
+            background: rgba(0,0,0,0.08); pointer-events: none;
         }
         .hero-logo {
             width: 48px; height: 48px;
@@ -1415,15 +1368,12 @@ def inject_css():
             font-weight: 800; color: #fff; font-size: 1.4rem;
             flex-shrink: 0; backdrop-filter: blur(4px);
         }
-        .hero-logo img {
-            width: 40px; height: 40px; object-fit: contain; border-radius: 6px;
-        }
+        .hero-logo img { width: 40px; height: 40px; object-fit: contain; border-radius: 6px; }
         .hero-text { flex: 1; }
         .hero-title {
             font-family: 'Syne', sans-serif;
             font-size: 1.15rem; font-weight: 800;
-            color: #fff; margin: 0; line-height: 1.1;
-            letter-spacing: -0.3px;
+            color: #fff; margin: 0; line-height: 1.1; letter-spacing: -0.3px;
         }
         .hero-sub {
             font-size: 0.68rem; color: rgba(255,255,255,0.65);
@@ -1431,8 +1381,7 @@ def inject_css():
             text-transform: uppercase; font-weight: 400;
         }
         .hero-pill {
-            background: var(--red-900);
-            color: rgba(255,255,255,0.9);
+            background: var(--red-900); color: rgba(255,255,255,0.9);
             font-size: 0.6rem; font-weight: 700;
             padding: 5px 12px; border-radius: 20px;
             letter-spacing: 0.1em; text-transform: uppercase;
@@ -1440,18 +1389,14 @@ def inject_css():
         }
 
         .sec-label {
-            display: flex; align-items: center; gap: 10px;
-            margin: 32px 0 14px;
+            display: flex; align-items: center; gap: 10px; margin: 32px 0 14px;
         }
-        .sec-label-line {
-            flex: 1; height: 1px; background: var(--line);
-        }
+        .sec-label-line { flex: 1; height: 1px; background: var(--line); }
         .sec-label-text {
             font-family: 'Syne', sans-serif;
             font-size: 0.62rem; font-weight: 700;
             letter-spacing: 0.14em; text-transform: uppercase;
-            color: var(--red-700);
-            white-space: nowrap;
+            color: var(--red-700); white-space: nowrap;
         }
 
         .steps-grid {
@@ -1463,24 +1408,18 @@ def inject_css():
             border: 1px solid var(--line);
             border-top: 3px solid var(--red-700);
             border-radius: 0 0 10px 10px;
-            padding: 20px 18px 18px;
-            position: relative;
+            padding: 20px 18px 18px; position: relative;
             transition: box-shadow 0.2s;
         }
-        .step-card:hover {
-            box-shadow: 0 6px 24px rgba(192,0,0,0.08);
-        }
+        .step-card:hover { box-shadow: 0 6px 24px rgba(192,0,0,0.08); }
         .step-num {
             font-family: 'Syne', sans-serif;
             font-size: 2rem; font-weight: 800;
-            color: var(--red-100);
-            line-height: 1; margin-bottom: 10px;
-            user-select: none;
+            color: var(--red-100); line-height: 1; margin-bottom: 10px; user-select: none;
         }
         .step-title {
             font-family: 'Syne', sans-serif;
-            font-size: 0.82rem; font-weight: 700;
-            color: var(--ash); margin-bottom: 7px;
+            font-size: 0.82rem; font-weight: 700; color: var(--ash); margin-bottom: 7px;
         }
         .step-desc { font-size: 0.73rem; color: var(--steel); line-height: 1.6; }
 
@@ -1497,43 +1436,29 @@ def inject_css():
             padding: 10px !important;
             transition: background 0.2s !important;
         }
-        [data-testid="stFileUploader"]:hover {
-            background: var(--red-100) !important;
-        }
+        [data-testid="stFileUploader"]:hover { background: var(--red-100) !important; }
 
         [data-testid="stBaseButton-primary"],
         .stButton button[kind="primary"] {
-            background: var(--red-700) !important;
-            color: #fff !important;
-            border: none !important;
-            border-radius: 6px !important;
-            font-family: 'Syne', sans-serif !important;
-            font-weight: 700 !important;
-            font-size: 0.82rem !important;
-            padding: 11px 28px !important;
-            letter-spacing: 0.04em !important;
-            text-transform: uppercase !important;
+            background: var(--red-700) !important; color: #fff !important;
+            border: none !important; border-radius: 6px !important;
+            font-family: 'Syne', sans-serif !important; font-weight: 700 !important;
+            font-size: 0.82rem !important; padding: 11px 28px !important;
+            letter-spacing: 0.04em !important; text-transform: uppercase !important;
             transition: background 0.15s !important;
         }
         [data-testid="stBaseButton-primary"]:hover,
-        .stButton button[kind="primary"]:hover {
-            background: var(--red-900) !important;
-        }
+        .stButton button[kind="primary"]:hover { background: var(--red-900) !important; }
 
         .result-banner {
-            background: var(--white);
-            border: 1px solid var(--line);
-            border-left: 5px solid var(--red-700);
-            border-radius: 8px;
-            padding: 18px 22px;
-            display: flex; align-items: center; gap: 16px;
+            background: var(--white); border: 1px solid var(--line);
+            border-left: 5px solid var(--red-700); border-radius: 8px;
+            padding: 18px 22px; display: flex; align-items: center; gap: 16px;
             margin-bottom: 22px;
         }
         .result-icon {
-            width: 40px; height: 40px;
-            background: var(--red-700);
-            border-radius: 8px;
-            display: flex; align-items: center; justify-content: center;
+            width: 40px; height: 40px; background: var(--red-700);
+            border-radius: 8px; display: flex; align-items: center; justify-content: center;
             font-size: 1.1rem; flex-shrink: 0;
         }
         .result-text {
@@ -1546,11 +1471,9 @@ def inject_css():
         .metrics-row-3 { grid-template-columns: repeat(3, 1fr); }
         .metrics-row-4 { grid-template-columns: repeat(4, 1fr); }
         .metric-card {
-            background: var(--white);
-            border: 1px solid var(--line);
+            background: var(--white); border: 1px solid var(--line);
             border-bottom: 3px solid var(--red-700);
-            border-radius: 8px 8px 0 0;
-            padding: 16px 18px 14px;
+            border-radius: 8px 8px 0 0; padding: 16px 18px 14px;
         }
         .metric-label {
             font-family: 'Syne', sans-serif;
@@ -1560,8 +1483,7 @@ def inject_css():
         }
         .metric-value {
             font-family: 'Syne', sans-serif;
-            font-size: 1.8rem; font-weight: 800;
-            color: var(--ash); line-height: 1;
+            font-size: 1.8rem; font-weight: 800; color: var(--ash); line-height: 1;
         }
         .metric-value.red   { color: var(--red-700); }
         .metric-value.green { color: var(--green); }
@@ -1569,8 +1491,7 @@ def inject_css():
 
         [data-testid="stTabs"] [data-baseweb="tab"] {
             font-family: 'Syne', sans-serif !important;
-            font-size: 0.74rem !important;
-            font-weight: 700 !important;
+            font-size: 0.74rem !important; font-weight: 700 !important;
             letter-spacing: 0.03em !important;
         }
         [data-testid="stTabs"] [aria-selected="true"] {
@@ -1579,70 +1500,49 @@ def inject_css():
         }
 
         [data-testid="stDataFrame"] {
-            border-radius: 8px !important;
-            overflow: hidden !important;
+            border-radius: 8px !important; overflow: hidden !important;
             border: 1px solid var(--line) !important;
         }
 
         .stCode, [data-testid="stCode"] {
             font-family: 'IBM Plex Mono', monospace !important;
-            font-size: 0.71rem !important;
-            background: var(--ash) !important;
-            color: #E8E3DD !important;
-            border: none !important;
-            border-radius: 8px !important;
+            font-size: 0.71rem !important; background: var(--ash) !important;
+            color: #E8E3DD !important; border: none !important; border-radius: 8px !important;
         }
 
         [data-testid="stExpander"] {
             border: 1px solid var(--line) !important;
             border-left: 3px solid var(--red-700) !important;
-            border-radius: 0 8px 8px 0 !important;
-            background: var(--white) !important;
+            border-radius: 0 8px 8px 0 !important; background: var(--white) !important;
         }
         [data-testid="stExpanderToggleIcon"] { color: var(--red-700) !important; }
 
         [data-testid="stTextInput"] input {
-            border-radius: 6px !important;
-            border-color: var(--line) !important;
-            font-size: 0.82rem !important;
-            background: var(--white) !important;
+            border-radius: 6px !important; border-color: var(--line) !important;
+            font-size: 0.82rem !important; background: var(--white) !important;
         }
         [data-testid="stTextInput"] input:focus {
             border-color: var(--red-700) !important;
             box-shadow: 0 0 0 2px rgba(192,0,0,0.12) !important;
         }
 
-        [data-testid="stProgress"] > div > div {
-            background: var(--red-700) !important;
-        }
+        [data-testid="stProgress"] > div > div { background: var(--red-700) !important; }
 
-        hr {
-            border: none !important;
-            border-top: 1px solid var(--line) !important;
-            margin: 28px 0 !important;
-        }
+        hr { border: none !important; border-top: 1px solid var(--line) !important; margin: 28px 0 !important; }
 
         .footer {
-            margin-top: 56px; padding-top: 18px;
-            border-top: 1px solid var(--line);
-            text-align: center;
-            font-size: 0.62rem; letter-spacing: 0.1em;
+            margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line);
+            text-align: center; font-size: 0.62rem; letter-spacing: 0.1em;
             text-transform: uppercase; color: var(--silver);
         }
         .footer span { color: var(--red-700); font-weight: 700; }
 
-        [data-testid="stCheckbox"] label {
-            font-size: 0.82rem !important;
-            color: var(--ash) !important;
-        }
+        [data-testid="stCheckbox"] label { font-size: 0.82rem !important; color: var(--ash) !important; }
 
         .hint-bar {
-            background: var(--red-50);
-            border: 1px solid rgba(192,0,0,0.15);
-            border-radius: 6px;
-            padding: 10px 14px;
-            font-size: 0.71rem; color: var(--red-800);
-            margin-bottom: 18px;
+            background: var(--red-50); border: 1px solid rgba(192,0,0,0.15);
+            border-radius: 6px; padding: 10px 14px;
+            font-size: 0.71rem; color: var(--red-800); margin-bottom: 18px;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -1650,13 +1550,14 @@ def inject_css():
 
 # ─── TOPBAR ───────────────────────────────────────────────────────────────────
 def render_topbar():
-    logo_html = '<div class="topbar-logo-wrap">B</div>'
+    logo_html = "<div style='font-family:Syne,sans-serif;font-weight:800;color:#fff;font-size:1.4rem;'>B</div>"
     if os.path.exists(LOGO_PATH):
         import base64
         with open(LOGO_PATH, "rb") as f:
             logo_html = (
-                f'<img class="topbar-logo-img" '
-                f'src="data:image/png;base64,{base64.b64encode(f.read()).decode()}">'
+                f'<img class="hero-logo-img" '
+                f'src="data:image/png;base64,{base64.b64encode(f.read()).decode()}" '
+                f'style="width:40px;height:40px;object-fit:contain;border-radius:6px;">'
             )
     st.markdown(f"""
     <div class="hero">
@@ -1665,12 +1566,12 @@ def render_topbar():
             <p class="hero-title">BMG-HMO Automation</p>
             <p class="hero-sub">Billing File Processor · Internal Use Only</p>
         </div>
-        <div class="hero-pill">v10.8.1</div>
+        <div class="hero-pill">v10.8.2</div>
     </div>
     """, unsafe_allow_html=True)
 
 
-# ─── HOW IT WORKS ───────────────────────────────────────────────────────────
+# ─── HOW IT WORKS ─────────────────────────────────────────────────────────────
 def render_how_it_works():
     st.markdown("""
     <div class="steps-grid">
@@ -1679,16 +1580,16 @@ def render_how_it_works():
             <div class="step-title">Upload Monthly File</div>
             <div class="step-desc">
                 Upload any <strong>.xlsx</strong> or <strong>.xlsm</strong> billing file.
-                It must contain both an <em>Attachment</em> sheet and a
-                <em>Working File</em> sheet, and the word <em>MONTHLY</em>.
+                It must contain an <em>Attachment</em> sheet, a <em>Working File</em> sheet,
+                and the word <em>MONTHLY</em> somewhere in the filename or header rows.
             </div>
         </div>
         <div class="step-card">
             <div class="step-num">2</div>
             <div class="step-title">Auto-Sync & Validate</div>
             <div class="step-desc">
-                The app compares both sheets: financial values are refreshed from the Attachment,
-                new employees are appended, and no existing row is removed.
+                Financial values are refreshed from the Attachment, new employees are
+                appended, and no existing row is ever removed.
                 Manual / WF-only rows are flagged yellow.
             </div>
         </div>
@@ -1718,18 +1619,17 @@ def _metric(label: str, value, colour: str = "") -> str:
     </div>"""
 
 
-# ─── SYNC STATUS ───────────────────────────────────────────────────────────────
+# ─── SYNC STATUS ──────────────────────────────────────────────────────────────
 def render_sync_status(df: pd.DataFrame, att_ids: set[str]):
     has_att = bool(att_ids)
     rows = []
     for _, row in df.iterrows():
         rid    = _s(row.get("Id Number", ""))
         entity = _s(row.get("Entity", ""))
-        if has_att:
-            synced = rid in att_ids
-            source = "✅ From Attachment" if synced else "⚠️ Manual / WF-only"
-        else:
-            source = "— (no Attachment sheet)"
+        source = (
+            ("✅ From Attachment" if rid in att_ids else "⚠️ Manual / WF-only")
+            if has_att else "— (no Attachment sheet)"
+        )
         rows.append({
             "Id Number":      rid,
             "Name":           _s(row.get("Name",          "")),
@@ -1758,14 +1658,14 @@ def render_sync_status(df: pd.DataFrame, att_ids: set[str]):
     ])
 
     with tab_all:
-        st.caption("Every employee across all sheets. **Sheet** column shows which entity tab they land in.")
+        st.caption("Every employee across all sheets.")
         st.dataframe(all_df, use_container_width=True, hide_index=True)
 
     with tab_synced:
         if synced_df.empty:
             st.info("No employees matched any row in the Attachment sheet.")
         else:
-            st.caption(f"**{len(synced_df)}** employee(s) matched in the Attachment — financials refreshed.")
+            st.caption(f"**{len(synced_df)}** employee(s) matched — financials refreshed.")
             st.dataframe(synced_df, use_container_width=True, hide_index=True)
 
     with tab_manual:
@@ -1811,11 +1711,11 @@ def render_sync_status(df: pd.DataFrame, att_ids: set[str]):
                     st.dataframe(co_df, use_container_width=True, hide_index=True)
             else:
                 display = sub.drop(columns=["Sleek Group"], errors="ignore").reset_index(drop=True)
-                st.caption(f"**{len(display)}** row(s) → **{sname}** sheet in the downloaded file.")
+                st.caption(f"**{len(display)}** row(s) → **{sname}** sheet.")
                 st.dataframe(display, use_container_width=True, hide_index=True)
 
 
-# ─── ADD EMPLOYEE FORM ─────────────────────────────────────────────────────────
+# ─── ADD EMPLOYEE FORM ────────────────────────────────────────────────────────
 def render_add_employee(df: pd.DataFrame) -> pd.DataFrame | None:
     st.caption(
         "Fill the fields below and click **Add Employee**. "
@@ -1888,7 +1788,7 @@ def render_add_employee(df: pd.DataFrame) -> pd.DataFrame | None:
     return updated
 
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(
         page_title="BMG-HMO Automation",
@@ -1902,14 +1802,20 @@ def main():
     st.markdown('<div style="height:24px;"></div>', unsafe_allow_html=True)
     render_how_it_works()
 
-    st.markdown('<div class="upload-label">Upload Billing File (.xlsx / .xlsm)</div>',
-                unsafe_allow_html=True)
-    uploaded = st.file_uploader("Billing File Upload", type=["xlsx", "xlsm"], label_visibility="collapsed")
-
+    st.markdown(
+        '<div class="upload-label">Upload Billing File (.xlsx / .xlsm)</div>',
+        unsafe_allow_html=True,
+    )
+    # FIX 6 — non-empty label, hidden via label_visibility
+    uploaded = st.file_uploader(
+        "Billing File Upload",
+        type=["xlsx", "xlsm"],
+        label_visibility="collapsed",
+    )
 
     if not uploaded:
         st.markdown(
-            '<div class="footer">BMG-HMO Automation · Internal Use Only · v10.8.1</div>',
+            '<div class="footer">BMG-HMO Automation · Internal Use Only · <span>v10.8.2</span></div>',
             unsafe_allow_html=True,
         )
         return
@@ -1920,33 +1826,29 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # Initialise session state keys
     for key, default in [
         ("df", None), ("out_bytes", None),
         ("file_bytes", None), ("is_xlsm", False),
         ("out_name", ""), ("sync_summary", {}),
-        ("period_label", ""),
+        ("period_label", ""), ("proc_logs", []),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
 
     if st.button("⚙  Process File", type="primary"):
-        prog  = st.progress(0, text="Starting…")
+        prog = st.progress(0, text="Starting…")
         logs: list[str] = []
-
-        file_buffer = None
-        file_bytes = None
-        wb = None
+        wb   = None
 
         try:
             file_bytes = uploaded.read()
             is_xlsm    = uploaded.name.lower().endswith(".xlsm")
-            
-            # SAFE: Load workbook with proper cleanup
-            file_buffer = io.BytesIO(file_bytes)
-            try:
-                wb = load_workbook(file_buffer, keep_vba=is_xlsm)
-            finally:
-                file_buffer.close()
+
+            # FIX 2 — keep buffer open while wb is alive
+            buf_read = io.BytesIO(file_bytes)
+            wb       = load_workbook(buf_read, keep_vba=is_xlsm)
+            # buf_read intentionally left open; wb holds a reference
 
             prog.progress(10, text="Validating file…")
             logs.append("PHASE 1 · Validation")
@@ -1978,46 +1880,45 @@ def main():
             logs.append(f"  Missing : {len(mlog['missing'])}")
             logs.append(f"  Total   : {len(master)}")
 
-            prog.progress(80, text="Building output workbook… (this may take 30s)")
-            
-            # SAFE: Fresh workbook load for output
-            file_buffer2 = io.BytesIO(file_bytes)
-            try:
-                wb_out = load_workbook(file_buffer2, keep_vba=is_xlsm)
-            finally:
-                file_buffer2.close()
-            
-            wb_out    = _scrub_workbook(wb_out)
-            out_bytes = build_output(wb_out, df, is_xlsm=is_xlsm, period_label=period_label)
-            
-            prog.progress(95, text="Finalising…")
+            prog.progress(80, text="Building output workbook…")
 
-            prog.progress(100, text="Done ✓")
-            logs.append("")
-            logs.append("COMPLETE ✓")
-            logs.append("─" * 50)
-            logs.append("Sheets: Summary | Attachment | Working File | Sleek | NYFD | BMG Internal | SO")
+            # FIX 2 — fresh buffer for output wb, kept open
+            buf_out = io.BytesIO(file_bytes)
+            wb_out  = load_workbook(buf_out, keep_vba=is_xlsm)
+            wb_out  = _scrub_workbook(wb_out)
+            out_bytes = build_output(wb_out, df, is_xlsm=is_xlsm, period_label=period_label)
+
+            prog.progress(95, text="Finalising…")
 
             att_ids    = df.attrs.get("att_ids", set())
             entity_col = df["Entity"].apply(lambda e: _entity_sheet(_s(e)))
+
             st.session_state.df           = df
             st.session_state.out_bytes    = out_bytes
             st.session_state.file_bytes   = file_bytes
             st.session_state.is_xlsm      = is_xlsm
             st.session_state.out_name     = uploaded.name
-            st.session_state.proc_logs    = logs
             st.session_state.period_label = period_label
+            st.session_state.proc_logs    = logs
             st.session_state.sync_summary = {
-                "total":    len(df),
-                "synced":   sum(1 for i in df["Id Number"] if i in att_ids),
-                "manual":   sum(1 for i in df["Id Number"] if i not in att_ids),
-                "sleek":    int((entity_col == "Sleek").sum()),
-                "nyfd":     int((entity_col == "NYFD").sum()),
-                "bmg":      int((entity_col == "BMG Internal").sum()),
-                "so":       int((entity_col == "SO").sum()),
+                "total":  len(df),
+                "synced": sum(1 for i in df["Id Number"] if i in att_ids),
+                "manual": sum(1 for i in df["Id Number"] if i not in att_ids),
+                "sleek":  int((entity_col == "Sleek").sum()),
+                "nyfd":   int((entity_col == "NYFD").sum()),
+                "bmg":    int((entity_col == "BMG Internal").sum()),
+                "so":     int((entity_col == "SO").sum()),
             }
-            
-            gc.collect()  # Final cleanup
+
+            logs.append("")
+            logs.append("COMPLETE ✓")
+            logs.append("─" * 50)
+            logs.append("Sheets: Summary | Attachment | Working File | Sleek | NYFD | BMG Internal | SO")
+
+            # FIX 3 — clear progress bar on success to prevent white-flash rerun loop
+            time.sleep(0.4)
+            prog.empty()
+            gc.collect()
 
         except ValueError as ve:
             prog.empty()
@@ -2027,24 +1928,15 @@ def main():
             st.error(f"Sheet/column not found: {ke}")
         except Exception as ex:
             prog.empty()
-            st.error(f"Unexpected error: {ex}\n\nPlease see logs for details.")
+            st.error(f"Unexpected error: {ex}")
             import traceback
             st.code(traceback.format_exc(), language="python")
         finally:
-            # Cleanup resources
-            if file_buffer:
-                try:
-                    file_buffer.close()
-                except:
-                    pass
-            if wb:
-                try:
-                    wb.close()
-                except:
-                    pass
+            # FIX 1 — no wb.close() (openpyxl has none); just let gc handle it
+            wb = None
             gc.collect()
 
-    # Results panel
+    # ── Results panel ──────────────────────────────────────────────────────────
     if st.session_state.df is not None:
         df      = st.session_state.df
         att_ids = df.attrs.get("att_ids", set())
@@ -2057,7 +1949,9 @@ def main():
             <div class="result-icon">✅</div>
             <div>
                 <div class="result-text">File processed successfully — ready to download</div>
-                <div class="result-sub">{ss.get('total', 0)} records across 7 sheets · Summary sheet included</div>
+                <div class="result-sub">
+                    {ss.get('total', 0)} records across 7 sheets · Summary sheet included
+                </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -2097,10 +1991,13 @@ def main():
         st.divider()
 
         st.markdown('<div class="sec-label">Employee Lookup</div>', unsafe_allow_html=True)
+        # FIX 6 — non-empty label, hidden via label_visibility
         search = st.text_input(
-    "Employee Lookup", placeholder="Search by Id Number or Name…",
-    label_visibility="collapsed", key="lookup",
-)
+            "Employee Lookup",
+            placeholder="Search by Id Number or Name…",
+            label_visibility="collapsed",
+            key="lookup",
+        )
         if search:
             mask = (
                 df["Id Number"].astype(str).str.contains(search, case=False, na=False) |
@@ -2119,28 +2016,30 @@ def main():
 
         st.divider()
 
-        st.markdown('<div class="sec-label">Add New Employee (Optional)</div>',
-                    unsafe_allow_html=True)
-        if st.checkbox("➕  Add a new employee to the Working File", value=False,
-                       key="show_add_emp"):
+        st.markdown(
+            '<div class="sec-label">Add New Employee (Optional)</div>',
+            unsafe_allow_html=True,
+        )
+        # FIX 4 — removed value=False to prevent rerun loop
+        if st.checkbox("➕  Add a new employee to the Working File", key="show_add_emp"):
             updated_df = render_add_employee(df)
             if updated_df is not None:
-                file_buffer3 = io.BytesIO(st.session_state.file_bytes)
-                try:
-                    wb2 = load_workbook(file_buffer3, keep_vba=st.session_state.is_xlsm)
-                finally:
-                    file_buffer3.close()
-                
-                wb2       = _scrub_workbook(wb2)
-                new_bytes = build_output(wb2, updated_df,
-                                         is_xlsm=st.session_state.is_xlsm,
-                                         period_label=st.session_state.period_label)
+                # FIX 2 — keep buffer open while wb2 is alive
+                buf_add = io.BytesIO(st.session_state.file_bytes)
+                wb2     = load_workbook(buf_add, keep_vba=st.session_state.is_xlsm)
+                wb2     = _scrub_workbook(wb2)
+                new_bytes = build_output(
+                    wb2, updated_df,
+                    is_xlsm=st.session_state.is_xlsm,
+                    period_label=st.session_state.period_label,
+                )
                 st.session_state.df        = updated_df
                 st.session_state.out_bytes = new_bytes
+                gc.collect()
                 st.rerun()
 
     st.markdown(
-        '<div class="footer">BMG-HMO Automation · Internal Use Only · v10.8.1</div>',
+        '<div class="footer">BMG-HMO Automation · Internal Use Only · <span>v10.8.2</span></div>',
         unsafe_allow_html=True,
     )
 
